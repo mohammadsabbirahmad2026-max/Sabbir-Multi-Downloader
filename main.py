@@ -18,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- কনফিগারেশন ---
-BOT_TOKEN = "8363612564:AAGZDZZbyoaxS3V6PJZ7w0CdCgZ_scKP6o8"
+BOT_TOKEN = "8363612564:AAHWd_YIubc7LWbBnxWhONSigTYGVSR5JOs"
 ADMIN_ID = 6928091474 
 GEMINI_KEY = "AIzaSyCkuQjBT41-PpFUSVpHc2zw5qB4AURReQ4"
 IMAGE_URL = "https://i.postimg.cc/qvcLFtWx/default-profile.jpg"
