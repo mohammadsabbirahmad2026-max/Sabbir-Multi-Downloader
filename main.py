@@ -1,269 +1,213 @@
-import logging
-import asyncio
-import yt_dlp
-import datetime
 import sqlite3
+import requests
+import logging
+import time
 import os
-import google.generativeai as genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.constants import ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from keep_alive import keep_alive
 
-# --- লগিং সেটআপ ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# --- কনফিগারেশন (আপনার নতুন টোকেন ও আইডি) ---
+BOT_TOKEN = "8055526604:AAEq30KmGRaxRJXh7RCMoYj36mTdZilToZI"
+ADMIN_ID = 6928091474
+LOG_CHANNEL = -1003725140237
+WELCOME_PIC = "https://i.postimg.cc/qvcLFtWx/default-profile.jpg"
 
-# --- কনফিগারেশন ---
-BOT_TOKEN = "8363612564:AAHWd_YIubc7LWbBnxWhONSigTYGVSR5JOs"
-ADMIN_ID = 6928091474 
-GEMINI_KEY = "AIzaSyCkuQjBT41-PpFUSVpHc2zw5qB4AURReQ4"
-IMAGE_URL = "https://i.postimg.cc/qvcLFtWx/default-profile.jpg"
-DEV_NAME = "Mohammad Sabbir Ahmad"
+# লগিং কনফিগার
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- জেমিনি এআই ইঞ্জিন ---
-genai.configure(api_key=GEMINI_KEY)
-# জেমিনি সেটিংস: এটি যাতে ফিল্টার না করে সব উত্তর দেয়
-generation_config = {
-    "temperature": 0.9,
-    "top_p": 1,
-    "top_k": 1,
-    "max_output_tokens": 2048,
-}
-model = genai.GenerativeModel(
-    model_name='gemini-1.5-flash',
-    generation_config=generation_config,
-    safety_settings=[
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-)
-chat_sessions = {}
-
-# --- ডাটাবেস সিস্টেম (Thread-Safe) ---
-class Database:
+# --- প্রিমিয়াম ডাটাবেজ ক্লাস ---
+class GSMDatabase:
     def __init__(self):
-        self.db_path = "master_bot.db"
-        self._init_db()
+        self.conn = sqlite3.connect("gsm_v13_beast.db", check_same_thread=False)
+        self.cur = self.conn.cursor()
+        self.cur.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY, 
+            approved INTEGER DEFAULT 0, 
+            limit_count INTEGER DEFAULT 0, 
+            used INTEGER DEFAULT 0)""")
+        self.conn.commit()
 
-    def _get_connection(self):
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+    def add_user(self, uid):
+        self.cur.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (uid,))
+        self.conn.commit()
 
-    def _init_db(self):
-        with self._get_connection() as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS users 
-                         (id INTEGER PRIMARY KEY, name TEXT, uname TEXT, date TEXT)""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS stats 
-                         (key TEXT PRIMARY KEY, value INTEGER)""")
-            conn.commit()
+    def get_info(self, uid):
+        self.cur.execute("SELECT approved, limit_count, used FROM users WHERE id=?", (uid,))
+        return self.cur.fetchone()
 
-    def register_user(self, uid, name, uname):
-        with self._get_connection() as conn:
-            conn.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, ?)", 
-                         (uid, name, uname, datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
-            conn.commit()
+    def set_limit(self, uid, count):
+        self.cur.execute("UPDATE users SET approved=1, limit_count=?, used=0 WHERE id=?", (count, uid))
+        self.conn.commit()
 
-    def get_all_users(self):
-        with self._get_connection() as conn:
-            return conn.execute("SELECT id FROM users").fetchall()
+    def update_usage(self, uid):
+        self.cur.execute("UPDATE users SET used = used + 1 WHERE id=?", (uid,))
+        self.conn.commit()
 
-db = Database()
+    def reset_user(self, uid):
+        self.cur.execute("UPDATE users SET approved=0, limit_count=0, used=0 WHERE id=?", (uid,))
+        self.conn.commit()
 
-# --- উন্নত মাল্টি-ডাউনলোডার ইঞ্জিন (TikTok/FB/YT/Insta) ---
-class DownloaderEngine:
-    @staticmethod
-    async def get_info(url):
-        # টিকটক এবং অন্যান্য প্ল্যাটফর্মের জন্য স্পেশাল ইউজার এজেন্ট
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'format': 'best',
-            'cachedir': False,
-            'noplaylist': True,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        }
-        try:
-            loop = asyncio.get_event_loop()
-            # এখানে 'download=False' মানে আমরা শুধু ভিডিও লিঙ্ক ও তথ্য বের করছি
-            return await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(ydl_opts).extract_info(url, download=False))
-        except Exception as e:
-            logger.error(f"Engine Error: {e}")
-            return None
+db = GSMDatabase()
 
-# --- UI এবং বাটন কন্ট্রোলার ---
-class UI:
-    @staticmethod
-    def main_menu(uid):
-        kb = [['👤 My Profile', '🆘 Support'], ['📜 Download History', '🧠 AI Chat']]
-        if uid == ADMIN_ID:
-            kb.insert(0, ['📊 Statistics', '📢 Broadcast'])
-        return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+# --- প্রোগ্রেস মিটার ---
+def create_meter(current, total):
+    try:
+        perc = (current / total) * 100
+        filled = int(perc / 10)
+        bar = "💠" * filled + "💿" * (10 - filled)
+        return f"{bar} {perc:.1f}%"
+    except: return "⏳ প্রসেসিং..."
 
-    @staticmethod
-    def cancel_kb():
-        return ReplyKeyboardMarkup([['❌ Cancel Operation']], resize_keyboard=True)
+# --- সুপার কার্ড ম্যানেজার ---
+async def send_fancy_card(chat_id, context, title, text, show_req=False):
+    kb = [[InlineKeyboardButton("👨‍💻 Admin", url=f"tg://user?id={ADMIN_ID}")]]
+    if show_req:
+        kb.insert(0, [InlineKeyboardButton("📩 অনুমতি নিন", callback_data=f"req_{chat_id}")])
+    try:
+        await context.bot.send_photo(
+            chat_id=chat_id, photo=WELCOME_PIC, 
+            caption=f"**{title}**\n\n{text}", 
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+        )
+    except: pass
 
-# --- কোর ফাংশনালিটি (হ্যান্ডেলার্স) ---
+# --- হাই-স্পিড ডাউনলোড ইঞ্জিন ---
+async def start_download(url, context, chat_id, msg_id, f_path):
+    start = time.time()
+    try:
+        r = requests.get(url, stream=True, timeout=120)
+        total = int(r.headers.get('content-length', 0))
+        done = 0
+        last_up = 0
+        with open(f_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=1024*1024):
+                if chunk:
+                    f.write(chunk)
+                    done += len(chunk)
+                    if time.time() - last_up > 3.0:
+                        speed = done / (time.time() - start) / (1024 * 1024)
+                        status = (f"🚀 **GSM PREMIUM SPEED** 🚀\n\n{create_meter(done, total)}\n\n"
+                                  f"🛰 স্পিড: `{speed:.2f} MB/s`\n"
+                                  f"📦 ডাটা: `{done/(1024*1024):.1f}MB` / `{total/(1024*1024):.1f}MB`")
+                        try: await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=status, parse_mode="Markdown")
+                        except: pass
+                        last_up = time.time()
+        return True
+    except: return False
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.register_user(user.id, user.full_name, user.username)
-    
-    msg = (f"👋 **আসসালামু আলাইকুম, {user.first_name}!**\n\n"
-           f"🚀 **Master Multi-Downloader AI-তে স্বাগতম।**\n"
-           f"━━━━━━━━━━━━━━━━━━\n"
-           f"✅ **সাপোর্টেড:** YouTube, TikTok, FB, Insta, Twitter\n"
-           f"🧠 **AI:** জেমিনি ১.৫ আল্ট্রা ফাস্ট\n"
-           f"👨‍💻 **Dev:** [{DEV_NAME}](tg://user?id={ADMIN_ID})\n"
-           f"━━━━━━━━━━━━━━━━━━\n"
-           f"যেকোনো ভিডিও লিঙ্ক দিন অথবা নিচে মেনু থেকে অপশন বেছে নিন।")
-    
-    await update.message.reply_photo(
-        photo=IMAGE_URL, 
-        caption=msg, 
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=UI.main_menu(user.id)
-    )
-
-async def global_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- মূল হ্যান্ডলার ---
+async def gsm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text
-    state = context.user_data.get('state')
 
-    # ক্যানসেল অপারেশন
-    if text == '❌ Cancel Operation' or text == '/cancel':
-        context.user_data['state'] = None
-        await update.message.reply_text("🏠 অপারেশন বাতিল করা হয়েছে। মূল মেনু:", reply_markup=UI.main_menu(uid))
-        return
+    # ১. এডমিন কন্ট্রোল
+    if uid == ADMIN_ID:
+        if 'rep_to' in context.user_data:
+            tid = context.user_data.pop('rep_to')
+            await send_fancy_card(tid, context, "📩 এডমিন থেকে মেসেজ", text)
+            await update.message.reply_text("✅ মেসেজ পাঠানো হয়েছে।")
+            return
+        if 'lim_to' in context.user_data:
+            tid = context.user_data.pop('lim_to')
+            if text.isdigit():
+                db.set_limit(tid, int(text))
+                await update.message.reply_text(f"✅ ইউজার `{tid}` অনুমোদিত। লিমিট: {text} টি।")
+                await send_fancy_card(tid, context, "🎉 অ্যাক্সেস কনফার্ম!", f"এডমিন আপনাকে অনুমতি দিয়েছেন। লিমিট: {text} টি।")
+            return
 
-    # অ্যাডমিন ব্রডকাস্ট সেকশন
-    if uid == ADMIN_ID and text == '📢 Broadcast':
-        context.user_data['state'] = 'await_bc'
-        await update.message.reply_text("📢 আপনার মেসেজটি লিখুন যা সবাইকে পাঠাতে চান:", reply_markup=UI.cancel_kb())
-        return
+    # ২. লিঙ্ক ডিটেকশন
+    if "tiktok.com" in text:
+        info = db.get_info(uid)
+        if not info or info[0] == 0 or info[2] >= info[1]:
+            await send_fancy_card(uid, context, "⚠️ অ্যাক্সেস নেই", "আপনার লিমিট শেষ অথবা অনুমতি নেই।", True)
+            return
 
-    if state == 'await_bc' and uid == ADMIN_ID:
-        users = db.get_all_users()
-        sent = 0
-        status_msg = await update.message.reply_text("📤 ব্রডকাস্টিং শুরু হয়েছে...")
-        for u in users:
-            try:
-                await update.message.copy(chat_id=u[0])
-                sent += 1
-                await asyncio.sleep(0.05)
-            except: pass
-        context.user_data['state'] = None
-        await status_msg.edit_text(f"✅ সফলভাবে {sent} জন ইউজারের কাছে পাঠানো হয়েছে।")
-        await update.message.reply_text("মূল মেনু:", reply_markup=UI.main_menu(uid))
-        return
-
-    # ডাউনলোড ইঞ্জিন হ্যান্ডলার (লিঙ্ক শনাক্তকরণ)
-    if "http" in text:
-        wait_msg = await update.message.reply_text("🔍 **লিঙ্ক এনালাইজ করছি... একটু অপেক্ষা করুন।**", parse_mode=ParseMode.MARKDOWN)
-        info = await DownloaderEngine.get_info(text)
-        
-        if info:
-            v_id = info.get('id', str(datetime.datetime.now().timestamp()))
-            # মেমোরি ম্যানেজমেন্টের জন্য ডাটা সেভ
-            context.user_data[v_id] = {
-                'url': info.get('url'),
-                'title': info.get('title', 'No Title'),
-                'thumb': info.get('thumbnail', IMAGE_URL),
-                'platform': info.get('extractor_key', 'Unknown')
-            }
-            
-            kb = [
-                [InlineKeyboardButton("🎬 Video Download", callback_data=f"dl_vid_{v_id}")],
-                [InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"dl_aud_{v_id}")]
-            ]
-            
-            await wait_msg.delete()
-            caption = (f"📝 **Title:** {info.get('title')[:100]}...\n\n"
-                       f"🌐 **Platform:** {info.get('extractor_key')}\n"
-                       f"👨‍💻 **Developer:** {DEV_NAME}")
-            
-            await update.message.reply_photo(
-                photo=info.get('thumbnail', IMAGE_URL),
-                caption=caption,
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await wait_msg.edit_text("❌ দুঃখিত! এই লিঙ্ক থেকে তথ্য পাওয়া যায়নি। লিঙ্কটি চেক করুন (TikTok বা FB এর ক্ষেত্রে নিশ্চিত হোন এটি পাবলিক)।")
-        return
-
-    # AI চ্যাট হ্যান্ডলার
-    if text and state != 'await_bc':
-        thinking = await update.message.reply_text("💭")
+        context.user_data['temp_url'] = text
+        m = await update.message.reply_text("🔍 তথ্য সংগ্রহ করছি...")
         try:
-            if uid not in chat_sessions:
-                chat_sessions[uid] = model.start_chat(history=[])
-            
-            response = chat_sessions[uid].send_message(text)
-            ai_reply = f"{response.text}\n\n✨ _Powered by {DEV_NAME}_"
-            await thinking.edit_text(ai_reply, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.error(f"Gemini Error: {e}")
-            await thinking.edit_text("💡 আমি এখন কিছুটা ক্লান্ত। দয়া করে কিছুক্ষণ পর আবার মেসেজ দিন।")
+            api = requests.get(f"https://www.tikwm.com/api/?url={text}").json()["data"]
+            context.bot_data[f"raw_{uid}"] = api
+            kb = [[InlineKeyboardButton("🎬 Video (HD)", callback_data=f"dl_v_{uid}"), 
+                   InlineKeyboardButton("🎵 Audio", callback_data=f"dl_a_{uid}")]]
+            if api.get("images"): kb.append([InlineKeyboardButton("🖼️ Photos", callback_data=f"dl_p_{uid}")])
+            await context.bot.send_photo(chat_id=uid, photo=api['author']['avatar'], caption="ডাউনলোড ফরম্যাট বেছে নিন:", reply_markup=InlineKeyboardMarkup(kb))
+            await m.delete()
+        except: await m.edit_text("❌ লিঙ্কে সমস্যা আছে।")
 
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- ক্যালব্যাক প্রসেস ---
+async def gsm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data
+    data, uid = query.data, query.from_user.id
+    p_link = f"[{uid}](tg://user?id={uid})"
     await query.answer()
-    
-    # ডাটা স্প্লিট (dl_vid_id)
-    parts = data.split("_", 2)
-    mode = parts[1] # vid or aud
-    v_id = parts[2]
-    
-    video_data = context.user_data.get(v_id)
-    if not video_data:
-        await query.message.reply_text("❌ সেশন শেষ হয়ে গেছে। দয়া করে আবার লিঙ্কটি পাঠান।")
-        return
 
-    # অ্যাডমিনকে রিপোর্ট পাঠানো
-    report = f"📥 **Download Activity**\nUser: {query.from_user.full_name}\nPlatform: {video_data['platform']}"
-    await context.bot.send_message(ADMIN_ID, report)
+    if data.startswith("req_"):
+        txt = f"🔔 **নতুন রিকোয়েস্ট!**\n👤 নাম: {query.from_user.full_name}\n🆔 আইডি: {p_link}"
+        kb = [[InlineKeyboardButton("✅ অনুমতি দিন", callback_data=f"conf_{uid}")]]
+        await context.bot.send_message(chat_id=ADMIN_ID, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await query.edit_message_caption(caption="✅ রিকোয়েস্ট পাঠানো হয়েছে।")
 
-    status = await query.message.reply_text("⚡ **প্রসেস করছি এবং টেলিগ্রামে আপলোড দিচ্ছি...**")
-    
-    try:
-        if mode == 'vid':
-            await query.message.reply_video(
-                video=video_data['url'], 
-                caption=f"✅ **{video_data['title']}**\n\n📥 Downloaded via @{context.bot.username}\n🛠 Dev: {DEV_NAME}",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await query.message.reply_audio(
-                audio=video_data['url'], 
-                title=video_data['title'],
-                caption=f"🎵 Audio Extracted by {DEV_NAME}"
-            )
-        await status.delete()
-        # কাজ শেষে মেমোরি থেকে ডাটা ডিলিট (বট যাতে স্লো না হয়)
-        del context.user_data[v_id]
-    except Exception as e:
-        logger.error(f"Upload Error: {e}")
-        await status.edit_text("❌ ফাইলটি অনেক বড় অথবা টেলিগ্রাম সার্ভার এই মুহূর্তে ফাইলটি নিতে পারছে না।")
+    elif data.startswith("conf_"):
+        tid = data.split("_")[1]
+        context.user_data['lim_to'] = tid
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"আইডি `{tid}` এর জন্য লিমিট সংখ্যা দিন:")
 
+    elif data.startswith("action_"):
+        tid = data.split("_")[1]
+        kb = [[InlineKeyboardButton("💬 রিপ্লাই", callback_data=f"rep_{tid}"), 
+               InlineKeyboardButton("❌ ব্লক/ক্যানসেল", callback_data=f"can_{tid}")]]
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"🛠 **ইউজার কন্ট্রোল: {tid}**", reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith("rep_"):
+        context.user_data['rep_to'] = data.split("_")[1]
+        await context.bot.send_message(chat_id=ADMIN_ID, text="👤 আপনার মেসেজটি লিখুন:")
+
+    elif data.startswith("can_"):
+        tid = data.split("_")[1]
+        db.reset_user(tid)
+        await send_fancy_card(tid, context, "❌ লিমিট বাতিল", "এডমিন আপনার অ্যাক্সেস বন্ধ করেছেন।", True)
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"✅ ইউজার `{tid}` ব্লক করা হয়েছে।")
+
+    elif data.startswith("dl_"):
+        mode, tid = data.split("_")[1], int(data.split("_")[2])
+        raw = context.bot_data.get(f"raw_{tid}")
+        orig_url = context.user_data.get('temp_url', 'Unknown')
+        if not raw: return
+
+        p_msg = await context.bot.send_message(chat_id=tid, text="🚀 কানেক্ট হচ্ছে...")
+        f_name = f"gsm_{tid}.mp4" if mode == 'v' else f"gsm_{tid}.mp3"
+        d_url = raw['play'] if mode == 'v' else raw['music']
+
+        success = False
+        if mode in ['v', 'a']:
+            if await start_download(d_url, context, tid, p_msg.message_id, f_name):
+                await p_msg.edit_text("📤 আপলোড শুরু হচ্ছে...")
+                if mode == 'v': await context.bot.send_video(chat_id=tid, video=open(f_name, 'rb'), caption="✅ GSM PRO - ভিডিও")
+                else: await context.bot.send_audio(chat_id=tid, audio=open(f_name, 'rb'), caption="🎵 GSM PRO - অডিও")
+                os.remove(f_name)
+                success = True
+        elif mode == 'p':
+            media = [InputMediaPhoto(img) for img in raw['images'][:10]]
+            await context.bot.send_media_group(chat_id=tid, media=media)
+            success = True
+
+        if success:
+            await p_msg.delete()
+            db.update_usage(tid)
+            res = db.get_info(tid)
+            rem = res[1] - res[2]
+
+            # চ্যানেল রিপোর্ট (প্রোফাইল বাটন সহ)
+            kb_log = [[InlineKeyboardButton(f"👤 প্রোফাইল (ID: {tid})", url=f"tg://user?id={tid}")],
+                      [InlineKeyboardButton("🛠 অ্যাকশন নিন", callback_data=f"action_{tid}")] ]
+            log_cap = (f"📥 **ডাউনলোড রিপোর্ট**\n\n🎬 টাইপ: {mode}\n📊 অবশিষ্ট: **{rem}** টি\n🔗 লিঙ্ক: {orig_url}")
+            await context.bot.send_photo(chat_id=LOG_CHANNEL, photo=WELCOME_PIC, caption=log_cap, reply_markup=InlineKeyboardMarkup(kb_log))
+
+# --- রান ---
 if __name__ == '__main__':
-    # রেন্ডারে বট ২৪/৭ সচল রাখার জন্য
-    keep_alive()
-    
-    # অ্যাপ্লিকেশন বিল্ড
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # হ্যান্ডেলার রেজিস্টার
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", global_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, global_handler))
-    app.add_handler(CallbackQueryHandler(callback_query_handler))
-    
-    print(f"✅ {DEV_NAME}-এর মাস্টার বট সচল হয়েছে...")
+    app.add_handler(CommandHandler("start", lambda u, c: (db.add_user(u.effective_user.id), send_fancy_card(u.effective_user.id, c, "✨ স্বাগতম", "অনুমতি নিতে নিচের বাটনে চাপ দিন।", True))))
+    app.add_handler(CallbackQueryHandler(gsm_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, gsm_handler))
+    print("🔥 GSM Ultra Beast V13 is Active! 🔥")
     app.run_polling()
